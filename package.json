@@ -1,0 +1,31 @@
+{
+  "name": "pi-thinking-translator",
+  "version": "0.1.0",
+  "description": "Translate English thinking blocks from specified models into Chinese and display below the original thinking block in Pi.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "thinking",
+    "translator"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zhangyu-ch/pi-thinking-translator.git"
+  },
+  "homepage": "https://github.com/zhangyu-ch/pi-thinking-translator#readme",
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/core.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}
