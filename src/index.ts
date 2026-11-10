@@ -11,12 +11,15 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, type SelectItem, SelectList, type SettingItem, SettingsList, Text } from "@earendil-works/pi-tui";
 import {
+	type AvailableModelInfo,
 	DEFAULT_CONFIG,
 	extractThinkingRuns,
 	formatTranslatedThinking,
 	matchesSourceModel,
 	parseProviderAndModel,
+	setSourceModelSelected,
 	shouldTranslateThinking,
+	syncDefaultSourceModels,
 	type TranslatorConfig,
 	VALID_THINKING_LEVELS,
 } from "./core.ts";
@@ -39,7 +42,11 @@ function getConfigPath(): string {
 function loadConfig(): TranslatorConfig {
 	const path = getConfigPath();
 	if (!existsSync(path)) {
-		return { ...DEFAULT_CONFIG, sourceModels: [...DEFAULT_CONFIG.sourceModels] };
+		return {
+			...DEFAULT_CONFIG,
+			sourceModels: [...DEFAULT_CONFIG.sourceModels],
+			excludedModels: [],
+		};
 	}
 	try {
 		const raw = JSON.parse(readFileSync(path, "utf-8")) as Partial<TranslatorConfig>;
@@ -48,6 +55,9 @@ function loadConfig(): TranslatorConfig {
 			sourceModels: Array.isArray(raw.sourceModels)
 				? raw.sourceModels.filter((m): m is string => typeof m === "string" && m.trim().length > 0)
 				: [...DEFAULT_CONFIG.sourceModels],
+			excludedModels: Array.isArray(raw.excludedModels)
+				? raw.excludedModels.filter((m): m is string => typeof m === "string" && m.trim().length > 0)
+				: [],
 			translatorModel:
 				typeof raw.translatorModel === "string" && raw.translatorModel.trim()
 					? raw.translatorModel.trim()
@@ -59,7 +69,11 @@ function loadConfig(): TranslatorConfig {
 					: DEFAULT_CONFIG.translatorThinking,
 		};
 	} catch {
-		return { ...DEFAULT_CONFIG, sourceModels: [...DEFAULT_CONFIG.sourceModels] };
+		return {
+			...DEFAULT_CONFIG,
+			sourceModels: [...DEFAULT_CONFIG.sourceModels],
+			excludedModels: [],
+		};
 	}
 }
 
@@ -90,13 +104,27 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 		}
 	}
 
+	function syncSourceModels(ctx: ExtensionContext, extraModel?: { provider?: string; id?: string }): void {
+		const available: AvailableModelInfo[] = [...ctx.modelRegistry.getAvailable()];
+		if (ctx.model) available.push(ctx.model);
+		if (extraModel?.provider && extraModel?.id) {
+			available.push({ provider: extraModel.provider, id: extraModel.id });
+		}
+		const changed = syncDefaultSourceModels(config, available);
+		if (changed && existsSync(getConfigPath())) {
+			saveConfig(config);
+		}
+	}
+
 	function resolveTranslatorModel(ctx: ExtensionContext) {
 		const { provider, modelId } = parseProviderAndModel(config.translatorModel);
 		if (provider) {
 			const exact = ctx.modelRegistry.find(provider, modelId);
 			if (exact) return exact;
 		}
-		return ctx.modelRegistry.getAll().find((m) => `${m.provider}/${m.id}` === config.translatorModel || m.id === modelId);
+		return ctx.modelRegistry
+			.getAvailable()
+			.find((m) => `${m.provider}/${m.id}` === config.translatorModel || m.id === modelId);
 	}
 
 	function translateText(sourceText: string, ctx: ExtensionContext): Promise<string | undefined> {
@@ -195,6 +223,7 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		config = loadConfig();
+		syncSourceModels(ctx);
 		restoreTranslationsFromBranch(ctx);
 	});
 
@@ -204,6 +233,7 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 
 	pi.on("message_update", async (event, ctx) => {
 		if (!config.enabled || event.message.role !== "assistant") return;
+		syncSourceModels(ctx, { provider: event.message.provider, id: event.message.model });
 		if (!matchesSourceModel(config.sourceModels, event.message.provider, event.message.model, ctx.model)) return;
 
 		if (event.assistantMessageEvent.type === "thinking_end") {
@@ -213,6 +243,7 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 
 	pi.on("message_end", async (event, ctx) => {
 		if (!config.enabled || event.message.role !== "assistant") return;
+		syncSourceModels(ctx, { provider: event.message.provider, id: event.message.model });
 		if (!matchesSourceModel(config.sourceModels, event.message.provider, event.message.model, ctx.model)) return;
 
 		const { blocks, runs } = extractThinkingRuns(event.message.content);
@@ -232,13 +263,17 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 	});
 
 	async function openConfigUi(ctx: ExtensionCommandContext) {
-		const allModels = ctx.modelRegistry.getAll().map((m) => `${m.provider}/${m.id}`);
-		const modelSet = new Set<string>([...config.sourceModels, ...DEFAULT_CONFIG.sourceModels, ...allModels]);
-		const selectedSet = new Set<string>(config.sourceModels);
+		syncSourceModels(ctx);
+		const localModelSet = new Set<string>(ctx.modelRegistry.getAvailable().map((m) => `${m.provider}/${m.id}`));
+		if (ctx.model) {
+			localModelSet.add(`${ctx.model.provider}/${ctx.model.id}`);
+		}
+		const isSelected = (modelId: string) =>
+			config.sourceModels.some((m) => m.trim().toLowerCase() === modelId.toLowerCase());
 
-		const sortedModels = Array.from(modelSet).sort((a, b) => {
-			const aSel = selectedSet.has(a) ? 0 : 1;
-			const bSel = selectedSet.has(b) ? 0 : 1;
+		const sortedModels = Array.from(localModelSet).sort((a, b) => {
+			const aSel = isSelected(a) ? 0 : 1;
+			const bSel = isSelected(b) ? 0 : 1;
 			if (aSel !== bSel) return aSel - bSel;
 			return a.localeCompare(b);
 		});
@@ -258,7 +293,14 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 					description: "用于翻译思维链的模型 (Enter 选择)",
 					currentValue: config.translatorModel,
 					submenu: (currentVal, submenuDone) => {
-						const selectItems: SelectItem[] = Array.from(modelSet).map((m) => ({
+						const translatorCandidates = Array.from(
+							new Set([currentVal, ...localModelSet].filter(Boolean)),
+						).sort((a, b) => {
+							if (a === currentVal) return -1;
+							if (b === currentVal) return 1;
+							return a.localeCompare(b);
+						});
+						const selectItems: SelectItem[] = translatorCandidates.map((m) => ({
 							value: m,
 							label: m === currentVal ? `${m} (当前)` : m,
 						}));
@@ -288,7 +330,7 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 						id: `model:${modelId}`,
 						label: `[源模型] ${modelId}`,
 						description: "按 Enter/Space 切换是否翻译该模型的思维链（支持多选）",
-						currentValue: selectedSet.has(modelId) ? "✓ 已选中" : "未选中",
+						currentValue: isSelected(modelId) ? "✓ 已选中" : "未选中",
 						values: ["✓ 已选中", "未选中"],
 					}),
 				),
@@ -314,12 +356,7 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 						config.translatorThinking = newValue as ThinkingLevel;
 					} else if (id.startsWith("model:")) {
 						const modelId = id.slice("model:".length);
-						if (newValue === "✓ 已选中") {
-							selectedSet.add(modelId);
-						} else {
-							selectedSet.delete(modelId);
-						}
-						config.sourceModels = Array.from(selectedSet);
+						setSourceModelSelected(config, modelId, newValue === "✓ 已选中");
 					}
 					saveConfig(config);
 				},
@@ -344,6 +381,7 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 	pi.registerCommand("thinking-translate", {
 		description: "配置英文思维链自动翻译 (支持多选源模型、指定翻译模型)",
 		handler: async (args, ctx) => {
+			syncSourceModels(ctx);
 			const parts = args.trim().split(/\s+/).filter(Boolean);
 			const sub = parts[0]?.toLowerCase();
 
@@ -353,7 +391,7 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 					return;
 				}
 				ctx.ui.notify(
-					`思维链翻译: ${config.enabled ? "开启" : "关闭"} | 源模型: ${config.sourceModels.join(", ")} | 翻译模型: ${config.translatorModel} (${config.translatorThinking})`,
+					`思维链翻译: ${config.enabled ? "开启" : "关闭"} | 源模型: ${config.sourceModels.join(", ") || "(无)"} | 翻译模型: ${config.translatorModel} (${config.translatorThinking})`,
 					"info",
 				);
 				return;
@@ -383,17 +421,15 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 
 			if (sub === "add" && parts[1]) {
 				const modelId = parts[1].trim();
-				if (!config.sourceModels.includes(modelId)) {
-					config.sourceModels.push(modelId);
-					saveConfig(config);
-				}
+				setSourceModelSelected(config, modelId, true);
+				saveConfig(config);
 				ctx.ui.notify(`已添加源模型: ${modelId} (当前: ${config.sourceModels.join(", ")})`, "info");
 				return;
 			}
 
 			if ((sub === "remove" || sub === "del") && parts[1]) {
 				const modelId = parts[1].trim();
-				config.sourceModels = config.sourceModels.filter((m) => m !== modelId);
+				setSourceModelSelected(config, modelId, false);
 				saveConfig(config);
 				ctx.ui.notify(`已移除源模型: ${modelId} (当前: ${config.sourceModels.join(", ") || "无"})`, "info");
 				return;
