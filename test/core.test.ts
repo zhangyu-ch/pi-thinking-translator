@@ -9,6 +9,7 @@ import {
 	parseProviderAndModel,
 	setSourceModelSelected,
 	shouldTranslateThinking,
+	splitThinkingParagraphs,
 	syncDefaultSourceModels,
 	type TranslatorConfig,
 } from "../src/core.ts";
@@ -98,17 +99,76 @@ describe("pi-thinking-translator core", () => {
 		assert.deepEqual(runs, [["First thought.", "Second thought."], ["Third thought after tool."]]);
 	});
 
+	it("splits thinking into paragraphs while preserving code fences and attaching headings", () => {
+		const raw = [
+			"### Phase 1",
+			"",
+			"First paragraph checking requirements.",
+			"",
+			"```ts",
+			"const a = 1;",
+			"",
+			"const b = 2;",
+			"```",
+			"",
+			"*   Bullet paragraph one.",
+			"",
+			"*   Bullet paragraph two.",
+		].join("\n");
+
+		assert.deepEqual(splitThinkingParagraphs(raw), [
+			"### Phase 1\n\nFirst paragraph checking requirements.",
+			"```ts\nconst a = 1;\n\nconst b = 2;\n```",
+			"*   Bullet paragraph one.",
+			"*   Bullet paragraph two.",
+		]);
+	});
+
 	it("checks if thinking text requires translation", () => {
 		assert.equal(shouldTranslateThinking("We need to check the config file."), true);
 		assert.equal(shouldTranslateThinking("   "), false);
 		assert.equal(shouldTranslateThinking("纯中文思考内容"), false);
+		assert.equal(shouldTranslateThinking("检查 `src/index.ts` 的实现"), false);
+		assert.equal(shouldTranslateThinking("```ts\nconst x = 1;\n\nreturn x;\n```"), false);
 	});
 
-	it("formats translated thinking below original markdown without duplication", () => {
-		const original = "Let us inspect the directory.";
-		const translation = "让我们检查一下目录。";
-		const formatted = formatTranslatedThinking(original, translation);
-		assert.equal(formatted, "Let us inspect the directory.\n\n---\n\n让我们检查一下目录。");
-		assert.equal(formatTranslatedThinking(formatted, translation), formatted);
+	it("formats per-paragraph translations directly below each paragraph without duplication", () => {
+		const p1 = "Let us inspect the directory.";
+		const p2 = "Next, verify external links and CSS.";
+		const p3 = "Finally, run the test suite.";
+		const map = new Map<string, string>([
+			[p1, "让我们检查一下目录。"],
+			[p2, "接下来，验证外链与 CSS。\n\n确保无外部依赖。"],
+		]);
+
+		const markdown = `${p1}\n\n${p2}\n\n${p3}`;
+		const formatted = formatTranslatedThinking(markdown, (s) => map.get(s));
+		assert.equal(
+			formatted,
+			[
+				"Let us inspect the directory.",
+				"",
+				"> 让我们检查一下目录。",
+				"",
+				"Next, verify external links and CSS.",
+				"",
+				"> 接下来，验证外链与 CSS。\n>\n> 确保无外部依赖。",
+				"",
+				"Finally, run the test suite.",
+			].join("\n"),
+		);
+
+		// Idempotent when called again on already-transformed markdown
+		assert.equal(formatTranslatedThinking(formatted, (s) => map.get(s)), formatted);
+
+		// Falls back to legacy whole-block cache if no per-paragraph entry exists
+		const legacyOnly = new Map<string, string>([[markdown, "整段旧缓存译文。"]]);
+		assert.equal(
+			formatTranslatedThinking(markdown, (s) => legacyOnly.get(s)),
+			`${markdown}\n\n> 整段旧缓存译文。`,
+		);
+
+		// Untouched when no translation exists
+		assert.equal(formatTranslatedThinking(markdown, () => undefined), markdown);
 	});
 });

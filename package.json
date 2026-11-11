@@ -1,6 +1,6 @@
 {
   "name": "pi-thinking-translator",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Translate English thinking blocks from specified models into Chinese and display below the original thinking block in Pi.",
   "type": "module",
   "keywords": [

@@ -5,7 +5,7 @@ Pi 编码助手插件：当指定模型（默认自动加入本地所有 Gemini 
 ## 功能特点
 
 - **仅显示本地可用模型并自动匹配**：模型列表从本地 Pi Agent 已配置的可用模型（`ctx.modelRegistry.getAvailable()`）获取，模型名称包含 `gemini`、`ds` 或 `deepseek` 的模型会自动进入需要翻译的源模型列表，也可通过交互界面或命令自由勾选/取消。
-- **流式并行翻译**：在主模型 `thinking_end` 阶段即刻后台发起 `magpie/group/ds-flash (low)` 流式翻译，并在对应思维链下方实时渲染。
+- **逐段流式并行翻译**：将长思维链按段落（自动保留代码块与标题结构）拆分，在主模型思考过程中每完成一段即刻后台发起 `magpie/group/ds-flash (low)` 流式翻译，并在**每一段英文下方直接紧跟对应的中文译文**，避免长段合并导致难以对照阅读。
 - **不污染上下文**：基于 `pi.registerMarkdownTransformer` (`assistant-thinking`) 渲染层注入译文，不修改原始 `AssistantMessage` 与 `thinkingSignature`，不消耗后续多轮对话上下文 Token。
 - **会话持久化缓存**：翻译结果自动写入当前会话分支的自定义条目，`/reload`、`/resume` 或 `/tree` 切换分支时无需重复请求翻译。
 

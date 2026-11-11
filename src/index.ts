@@ -19,6 +19,7 @@ import {
 	parseProviderAndModel,
 	setSourceModelSelected,
 	shouldTranslateThinking,
+	splitThinkingParagraphs,
 	syncDefaultSourceModels,
 	type TranslatorConfig,
 	VALID_THINKING_LEVELS,
@@ -30,6 +31,8 @@ interface TranslationCacheEntry {
 }
 
 const TRANSLATION_TIMEOUT_MS = 30_000;
+const MAX_CONCURRENT_TRANSLATIONS = 4;
+const MAX_LEGACY_UPGRADE_PARAGRAPHS = 40;
 const CUSTOM_ENTRY_TYPE = "thinking-translation";
 
 const SYSTEM_PROMPT =
@@ -90,17 +93,65 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 	const inFlightPromises = new Map<string, Promise<string | undefined>>();
 	const persistedKeys = new Set<string>();
 
-	function restoreTranslationsFromBranch(ctx: ExtensionContext) {
+	let activeTranslations = 0;
+	const waitQueue: Array<() => void> = [];
+
+	function acquireSlot(): Promise<void> {
+		if (activeTranslations < MAX_CONCURRENT_TRANSLATIONS) {
+			activeTranslations++;
+			return Promise.resolve();
+		}
+		return new Promise((resolve) => {
+			waitQueue.push(resolve);
+		});
+	}
+
+	function releaseSlot(): void {
+		const next = waitQueue.shift();
+		if (next) {
+			next();
+		} else {
+			activeTranslations--;
+		}
+	}
+
+	async function restoreTranslationsFromBranch(ctx: ExtensionContext) {
 		translations.clear();
 		persistedKeys.clear();
+		const legacyMultiParagraphSources: string[] = [];
+
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type === "custom" && entry.customType === CUSTOM_ENTRY_TYPE) {
 				const data = entry.data as TranslationCacheEntry | undefined;
-				if (data?.source && data?.translation) {
-					translations.set(data.source, data.translation);
-					persistedKeys.add(data.source);
+				const source = data?.source?.trim();
+				const translation = data?.translation?.trim();
+				if (source && translation) {
+					translations.set(source, translation);
+					persistedKeys.add(source);
+					if (splitThinkingParagraphs(source).length > 1) {
+						legacyMultiParagraphSources.push(source);
+					}
 				}
 			}
+		}
+
+		// shortcut: caps one-time legacy cache backfill at 40 paragraphs per session load, raise if old sessions exceed this
+		if (!config.enabled || legacyMultiParagraphSources.length === 0) return;
+
+		const missingParagraphs: string[] = [];
+		const seen = new Set<string>();
+		for (const source of legacyMultiParagraphSources) {
+			for (const paragraph of splitThinkingParagraphs(source)) {
+				if (!seen.has(paragraph) && shouldTranslateThinking(paragraph) && !translations.has(paragraph)) {
+					seen.add(paragraph);
+					missingParagraphs.push(paragraph);
+				}
+			}
+		}
+
+		if (missingParagraphs.length > 0) {
+			const batch = missingParagraphs.slice(0, MAX_LEGACY_UPGRADE_PARAGRAPHS);
+			await Promise.all(batch.map((paragraph) => translateText(paragraph, ctx)));
 		}
 	}
 
@@ -142,14 +193,23 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 			return Promise.resolve(undefined);
 		}
 
+		inFlight.set(key, "⏳ 正在翻译思维链...");
+
 		const promise = (async (): Promise<string | undefined> => {
+			await acquireSlot();
+			if (ctx.signal?.aborted) {
+				releaseSlot();
+				inFlight.delete(key);
+				inFlightPromises.delete(key);
+				return undefined;
+			}
+
 			const controller = new AbortController();
 			const timer = setTimeout(() => controller.abort(), TRANSLATION_TIMEOUT_MS);
 			const onAbort = () => controller.abort();
 			ctx.signal?.addEventListener("abort", onAbort, { once: true });
 
 			try {
-				inFlight.set(key, "⏳ 正在翻译思维链...");
 				const stream = ctx.modelRegistry.streamSimple(
 					model,
 					{
@@ -173,7 +233,10 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 				for await (const ev of stream) {
 					if (ev.type === "text_delta" && ev.delta) {
 						partial += ev.delta;
-						inFlight.set(key, partial.trim());
+						const trimmedPartial = partial.trim();
+						if (trimmedPartial) {
+							inFlight.set(key, trimmedPartial);
+						}
 					}
 				}
 
@@ -203,6 +266,7 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 				ctx.signal?.removeEventListener("abort", onAbort);
 				inFlight.delete(key);
 				inFlightPromises.delete(key);
+				releaseSlot();
 			}
 		})();
 
@@ -213,10 +277,7 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 	pi.registerMarkdownTransformer(
 		(markdown) => {
 			if (!config.enabled) return markdown;
-			const key = markdown.trim();
-			if (!key) return markdown;
-			const translated = translations.get(key) ?? inFlight.get(key);
-			return formatTranslatedThinking(markdown, translated);
+			return formatTranslatedThinking(markdown, (segment) => translations.get(segment) ?? inFlight.get(segment));
 		},
 		{ messageTypes: ["assistant-thinking"] },
 	);
@@ -224,11 +285,11 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		config = loadConfig();
 		syncSourceModels(ctx);
-		restoreTranslationsFromBranch(ctx);
+		await restoreTranslationsFromBranch(ctx);
 	});
 
 	pi.on("session_tree", async (_event, ctx) => {
-		restoreTranslationsFromBranch(ctx);
+		await restoreTranslationsFromBranch(ctx);
 	});
 
 	pi.on("message_update", async (event, ctx) => {
@@ -236,8 +297,24 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 		syncSourceModels(ctx, { provider: event.message.provider, id: event.message.model });
 		if (!matchesSourceModel(config.sourceModels, event.message.provider, event.message.model, ctx.model)) return;
 
-		if (event.assistantMessageEvent.type === "thinking_end") {
-			void translateText(event.assistantMessageEvent.content, ctx);
+		const ame = event.assistantMessageEvent;
+		if (ame.type === "thinking_delta") {
+			const { runs } = extractThinkingRuns(event.message.content);
+			const activeRun = runs[runs.length - 1];
+			if (!activeRun) return;
+			const completedParagraphs = splitThinkingParagraphs(activeRun.join("\n\n")).slice(0, -1);
+			for (const paragraph of completedParagraphs) {
+				void translateText(paragraph, ctx);
+			}
+		} else if (ame.type === "thinking_end") {
+			const { runs } = extractThinkingRuns(event.message.content);
+			const paragraphs =
+				runs.length > 0
+					? runs.flatMap((run) => splitThinkingParagraphs(run.join("\n\n")))
+					: splitThinkingParagraphs(ame.content);
+			for (const paragraph of paragraphs) {
+				void translateText(paragraph, ctx);
+			}
 		}
 	});
 
@@ -246,20 +323,11 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 		syncSourceModels(ctx, { provider: event.message.provider, id: event.message.model });
 		if (!matchesSourceModel(config.sourceModels, event.message.provider, event.message.model, ctx.model)) return;
 
-		const { blocks, runs } = extractThinkingRuns(event.message.content);
-		if (blocks.length === 0) return;
+		const { runs } = extractThinkingRuns(event.message.content);
+		if (runs.length === 0) return;
 
-		await Promise.all(blocks.map((block) => translateText(block, ctx)));
-
-		for (const run of runs) {
-			if (run.length <= 1) continue;
-			const runKey = run.join("\n\n");
-			if (translations.has(runKey)) continue;
-			const translatedParts = run.map((block) => translations.get(block)).filter((t): t is string => Boolean(t));
-			if (translatedParts.length === run.length) {
-				translations.set(runKey, translatedParts.join("\n\n"));
-			}
-		}
+		const paragraphs = runs.flatMap((run) => splitThinkingParagraphs(run.join("\n\n")));
+		await Promise.all(paragraphs.map((paragraph) => translateText(paragraph, ctx)));
 	});
 
 	async function openConfigUi(ctx: ExtensionCommandContext) {
