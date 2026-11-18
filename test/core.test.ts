@@ -4,13 +4,11 @@ import {
 	DEFAULT_CONFIG,
 	extractThinkingRuns,
 	formatTranslatedThinking,
-	isDefaultSourceModel,
-	matchesSourceModel,
 	parseProviderAndModel,
-	setSourceModelSelected,
+	setModelExcluded,
+	shouldTranslateModel,
 	shouldTranslateThinking,
 	splitThinkingParagraphs,
-	syncDefaultSourceModels,
 	type TranslatorConfig,
 } from "../src/core.ts";
 
@@ -29,61 +27,36 @@ describe("pi-thinking-translator core", () => {
 		});
 	});
 
-	it("matches configured source models accurately (multi-select)", () => {
-		const models = ["magpie/agy-cli/gemini-4-argon", "sub2api/grok-4.7"];
-		assert.equal(matchesSourceModel(models, "magpie", "agy-cli/gemini-4-argon"), true);
-		assert.equal(matchesSourceModel(models, "sub2api", "grok-4.7"), true);
-		assert.equal(matchesSourceModel(models, "magpie", "group/ds-flash"), false);
+	it("translates every model by default and honors exclusions", () => {
+		assert.equal(shouldTranslateModel([], "magpie", "agy-cli/gemini-4-argon"), true);
+		assert.equal(shouldTranslateModel([], "sub2api", "grok-4.7"), true);
+		assert.equal(shouldTranslateModel([], "sub2满血", "gpt-5.6-sol"), true);
+		assert.equal(shouldTranslateModel([], "magpie", "sanyee/claude-sonnet-5-5"), true);
+
+		const excluded = ["sub2api/grok-4.7", "gpt-5.6-sol"];
+		assert.equal(shouldTranslateModel(excluded, "sub2api", "grok-4.7"), false);
+		assert.equal(shouldTranslateModel(excluded, "another-provider", "gpt-5.6-sol"), false);
+		assert.equal(shouldTranslateModel(excluded, "magpie", "group/ds-flash"), true);
 		assert.equal(
-			matchesSourceModel(models, undefined, undefined, { provider: "magpie", id: "agy-cli/gemini-4-argon" }),
-			true,
+			shouldTranslateModel(excluded, undefined, undefined, { provider: "sub2api", id: "grok-4.7" }),
+			false,
 		);
 	});
 
-	it("identifies gemini, ds, and deepseek models as default source models", () => {
-		assert.equal(isDefaultSourceModel({ provider: "magpie", id: "agy-cli/gemini-4-argon" }), true);
-		assert.equal(isDefaultSourceModel({ provider: "magpie", id: "agy-cli/gemini-4-carbon" }), true);
-		assert.equal(isDefaultSourceModel({ provider: "magpie", id: "group/ds-flash" }), true);
-		assert.equal(isDefaultSourceModel({ provider: "sub2claude", id: "deepseek-v4-pro" }), true);
-		assert.equal(isDefaultSourceModel({ provider: "sub2claude", id: "deepseek-flash" }), true);
-		assert.equal(isDefaultSourceModel({ provider: "custom", id: "r1", name: "DeepSeek R1" }), true);
-		assert.equal(isDefaultSourceModel({ provider: "sub2满血", id: "gpt-5.6-sol" }), false);
-		assert.equal(isDefaultSourceModel({ provider: "magpie", id: "sanyee/claude-sonnet-5-5" }), false);
-		assert.equal(isDefaultSourceModel({ provider: "windsurf", id: "gpt-5-threads" }), false);
-	});
-
-	it("auto-syncs local gemini/ds/deepseek models while respecting user exclusions", () => {
+	it("toggles model exclusions without duplicates", () => {
 		const config: TranslatorConfig = {
 			...DEFAULT_CONFIG,
-			sourceModels: [],
 			excludedModels: [],
 		};
-		const localModels = [
-			{ provider: "magpie", id: "group/ds-flash" },
-			{ provider: "magpie", id: "agy-cli/gemini-4-argon" },
-			{ provider: "magpie", id: "agy-cli/gemini-4-carbon" },
-			{ provider: "sub2claude", id: "deepseek-v4-pro" },
-			{ provider: "sub2满血", id: "gpt-5.6-sol" },
-			{ provider: "sub2api", id: "grok-4.7" },
-		];
 
-		assert.equal(syncDefaultSourceModels(config, localModels), true);
-		assert.deepEqual(config.sourceModels, [
-			"magpie/group/ds-flash",
-			"magpie/agy-cli/gemini-4-argon",
-			"magpie/agy-cli/gemini-4-carbon",
-			"sub2claude/deepseek-v4-pro",
-		]);
+		setModelExcluded(config, "magpie/group/ds-flash", true);
+		setModelExcluded(config, "magpie/group/ds-flash", true);
+		assert.deepEqual(config.excludedModels, ["magpie/group/ds-flash"]);
+		assert.equal(shouldTranslateModel(config.excludedModels, "magpie", "group/ds-flash"), false);
 
-		// User unchecks one default model; subsequent sync must not re-add it
-		setSourceModelSelected(config, "magpie/group/ds-flash", false);
-		assert.equal(syncDefaultSourceModels(config, localModels), false);
-		assert.equal(config.sourceModels.includes("magpie/group/ds-flash"), false);
-
-		// Re-selecting clears exclusion
-		setSourceModelSelected(config, "magpie/group/ds-flash", true);
-		assert.equal(config.sourceModels.includes("magpie/group/ds-flash"), true);
+		setModelExcluded(config, "magpie/group/ds-flash", false);
 		assert.deepEqual(config.excludedModels, []);
+		assert.equal(shouldTranslateModel(config.excludedModels, "magpie", "group/ds-flash"), true);
 	});
 
 	it("extracts consecutive and separated thinking runs", () => {

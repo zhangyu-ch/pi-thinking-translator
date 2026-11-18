@@ -11,16 +11,14 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, type SelectItem, SelectList, type SettingItem, SettingsList, Text } from "@earendil-works/pi-tui";
 import {
-	type AvailableModelInfo,
 	DEFAULT_CONFIG,
 	extractThinkingRuns,
 	formatTranslatedThinking,
-	matchesSourceModel,
 	parseProviderAndModel,
-	setSourceModelSelected,
+	setModelExcluded,
+	shouldTranslateModel,
 	shouldTranslateThinking,
 	splitThinkingParagraphs,
-	syncDefaultSourceModels,
 	type TranslatorConfig,
 	VALID_THINKING_LEVELS,
 } from "./core.ts";
@@ -47,7 +45,6 @@ function loadConfig(): TranslatorConfig {
 	if (!existsSync(path)) {
 		return {
 			...DEFAULT_CONFIG,
-			sourceModels: [...DEFAULT_CONFIG.sourceModels],
 			excludedModels: [],
 		};
 	}
@@ -55,9 +52,6 @@ function loadConfig(): TranslatorConfig {
 		const raw = JSON.parse(readFileSync(path, "utf-8")) as Partial<TranslatorConfig>;
 		return {
 			enabled: typeof raw.enabled === "boolean" ? raw.enabled : DEFAULT_CONFIG.enabled,
-			sourceModels: Array.isArray(raw.sourceModels)
-				? raw.sourceModels.filter((m): m is string => typeof m === "string" && m.trim().length > 0)
-				: [...DEFAULT_CONFIG.sourceModels],
 			excludedModels: Array.isArray(raw.excludedModels)
 				? raw.excludedModels.filter((m): m is string => typeof m === "string" && m.trim().length > 0)
 				: [],
@@ -74,7 +68,6 @@ function loadConfig(): TranslatorConfig {
 	} catch {
 		return {
 			...DEFAULT_CONFIG,
-			sourceModels: [...DEFAULT_CONFIG.sourceModels],
 			excludedModels: [],
 		};
 	}
@@ -152,18 +145,6 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 		if (missingParagraphs.length > 0) {
 			const batch = missingParagraphs.slice(0, MAX_LEGACY_UPGRADE_PARAGRAPHS);
 			await Promise.all(batch.map((paragraph) => translateText(paragraph, ctx)));
-		}
-	}
-
-	function syncSourceModels(ctx: ExtensionContext, extraModel?: { provider?: string; id?: string }): void {
-		const available: AvailableModelInfo[] = [...ctx.modelRegistry.getAvailable()];
-		if (ctx.model) available.push(ctx.model);
-		if (extraModel?.provider && extraModel?.id) {
-			available.push({ provider: extraModel.provider, id: extraModel.id });
-		}
-		const changed = syncDefaultSourceModels(config, available);
-		if (changed && existsSync(getConfigPath())) {
-			saveConfig(config);
 		}
 	}
 
@@ -284,7 +265,6 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		config = loadConfig();
-		syncSourceModels(ctx);
 		await restoreTranslationsFromBranch(ctx);
 	});
 
@@ -294,8 +274,7 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 
 	pi.on("message_update", async (event, ctx) => {
 		if (!config.enabled || event.message.role !== "assistant") return;
-		syncSourceModels(ctx, { provider: event.message.provider, id: event.message.model });
-		if (!matchesSourceModel(config.sourceModels, event.message.provider, event.message.model, ctx.model)) return;
+		if (!shouldTranslateModel(config.excludedModels, event.message.provider, event.message.model, ctx.model)) return;
 
 		const ame = event.assistantMessageEvent;
 		if (ame.type === "thinking_delta") {
@@ -320,8 +299,7 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 
 	pi.on("message_end", async (event, ctx) => {
 		if (!config.enabled || event.message.role !== "assistant") return;
-		syncSourceModels(ctx, { provider: event.message.provider, id: event.message.model });
-		if (!matchesSourceModel(config.sourceModels, event.message.provider, event.message.model, ctx.model)) return;
+		if (!shouldTranslateModel(config.excludedModels, event.message.provider, event.message.model, ctx.model)) return;
 
 		const { runs } = extractThinkingRuns(event.message.content);
 		if (runs.length === 0) return;
@@ -331,17 +309,16 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 	});
 
 	async function openConfigUi(ctx: ExtensionCommandContext) {
-		syncSourceModels(ctx);
 		const localModelSet = new Set<string>(ctx.modelRegistry.getAvailable().map((m) => `${m.provider}/${m.id}`));
 		if (ctx.model) {
 			localModelSet.add(`${ctx.model.provider}/${ctx.model.id}`);
 		}
-		const isSelected = (modelId: string) =>
-			config.sourceModels.some((m) => m.trim().toLowerCase() === modelId.toLowerCase());
+		const isIncluded = (modelId: string) =>
+			!config.excludedModels.some((m) => m.trim().toLowerCase() === modelId.toLowerCase());
 
 		const sortedModels = Array.from(localModelSet).sort((a, b) => {
-			const aSel = isSelected(a) ? 0 : 1;
-			const bSel = isSelected(b) ? 0 : 1;
+			const aSel = isIncluded(a) ? 0 : 1;
+			const bSel = isIncluded(b) ? 0 : 1;
 			if (aSel !== bSel) return aSel - bSel;
 			return a.localeCompare(b);
 		});
@@ -351,7 +328,7 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 				{
 					id: "__enabled__",
 					label: "插件开关 (Enabled)",
-					description: "是否自动翻译选中模型的英文思维链",
+					description: "是否自动翻译所有模型的英文思维链",
 					currentValue: config.enabled ? "开启" : "关闭",
 					values: ["开启", "关闭"],
 				},
@@ -396,10 +373,10 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 				...sortedModels.map(
 					(modelId): SettingItem => ({
 						id: `model:${modelId}`,
-						label: `[源模型] ${modelId}`,
-						description: "按 Enter/Space 切换是否翻译该模型的思维链（支持多选）",
-						currentValue: isSelected(modelId) ? "✓ 已选中" : "未选中",
-						values: ["✓ 已选中", "未选中"],
+						label: `[模型] ${modelId}`,
+						description: "默认翻译；按 Enter/Space 排除或恢复该模型",
+						currentValue: isIncluded(modelId) ? "✓ 默认翻译" : "已排除",
+						values: ["✓ 默认翻译", "已排除"],
 					}),
 				),
 			];
@@ -424,7 +401,7 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 						config.translatorThinking = newValue as ThinkingLevel;
 					} else if (id.startsWith("model:")) {
 						const modelId = id.slice("model:".length);
-						setSourceModelSelected(config, modelId, newValue === "✓ 已选中");
+						setModelExcluded(config, modelId, newValue !== "✓ 默认翻译");
 					}
 					saveConfig(config);
 				},
@@ -447,9 +424,8 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("thinking-translate", {
-		description: "配置英文思维链自动翻译 (支持多选源模型、指定翻译模型)",
+		description: "配置英文思维链自动翻译 (默认所有模型，可排除指定模型)",
 		handler: async (args, ctx) => {
-			syncSourceModels(ctx);
 			const parts = args.trim().split(/\s+/).filter(Boolean);
 			const sub = parts[0]?.toLowerCase();
 
@@ -459,7 +435,7 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 					return;
 				}
 				ctx.ui.notify(
-					`思维链翻译: ${config.enabled ? "开启" : "关闭"} | 源模型: ${config.sourceModels.join(", ") || "(无)"} | 翻译模型: ${config.translatorModel} (${config.translatorThinking})`,
+					`思维链翻译: ${config.enabled ? "开启" : "关闭"} | 源模型: 全部（有思维链时） | 排除: ${config.excludedModels.join(", ") || "(无)"} | 翻译模型: ${config.translatorModel} (${config.translatorThinking})`,
 					"info",
 				);
 				return;
@@ -467,7 +443,7 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 
 			if (sub === "status") {
 				ctx.ui.notify(
-					`思维链翻译: ${config.enabled ? "开启" : "关闭"} | 源模型: ${config.sourceModels.join(", ") || "(无)"} | 翻译模型: ${config.translatorModel} (${config.translatorThinking})`,
+					`思维链翻译: ${config.enabled ? "开启" : "关闭"} | 源模型: 全部（有思维链时） | 排除: ${config.excludedModels.join(", ") || "(无)"} | 翻译模型: ${config.translatorModel} (${config.translatorThinking})`,
 					"info",
 				);
 				return;
@@ -489,17 +465,20 @@ export default function thinkingTranslatorExtension(pi: ExtensionAPI) {
 
 			if (sub === "add" && parts[1]) {
 				const modelId = parts[1].trim();
-				setSourceModelSelected(config, modelId, true);
+				setModelExcluded(config, modelId, false);
 				saveConfig(config);
-				ctx.ui.notify(`已添加源模型: ${modelId} (当前: ${config.sourceModels.join(", ")})`, "info");
+				ctx.ui.notify(`已恢复默认翻译: ${modelId}`, "info");
 				return;
 			}
 
 			if ((sub === "remove" || sub === "del") && parts[1]) {
 				const modelId = parts[1].trim();
-				setSourceModelSelected(config, modelId, false);
+				setModelExcluded(config, modelId, true);
 				saveConfig(config);
-				ctx.ui.notify(`已移除源模型: ${modelId} (当前: ${config.sourceModels.join(", ") || "无"})`, "info");
+				ctx.ui.notify(
+					`已排除模型: ${modelId} (当前排除: ${config.excludedModels.join(", ") || "无"})`,
+					"info",
+				);
 				return;
 			}
 

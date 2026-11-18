@@ -2,21 +2,13 @@ import type { ThinkingLevel } from "@earendil-works/pi-ai";
 
 export interface TranslatorConfig {
 	enabled: boolean;
-	sourceModels: string[];
-	excludedModels?: string[];
+	excludedModels: string[];
 	translatorModel: string;
 	translatorThinking: ThinkingLevel;
 }
 
-export interface AvailableModelInfo {
-	provider: string;
-	id: string;
-	name?: string;
-}
-
 export const DEFAULT_CONFIG: TranslatorConfig = {
 	enabled: true,
-	sourceModels: [],
 	excludedModels: [],
 	translatorModel: "magpie/group/ds-flash",
 	translatorThinking: "low",
@@ -24,53 +16,12 @@ export const DEFAULT_CONFIG: TranslatorConfig = {
 
 export const VALID_THINKING_LEVELS: ThinkingLevel[] = ["low", "minimal", "off", "medium", "high", "xhigh", "max"];
 
-const DEFAULT_SOURCE_MODEL_RE = /(?:gemini|deepseek|(?<![a-z])ds)/i;
-
-export function isDefaultSourceModel(modelOrSpec: string | AvailableModelInfo): boolean {
-	if (typeof modelOrSpec === "string") {
-		return DEFAULT_SOURCE_MODEL_RE.test(modelOrSpec);
-	}
-	return (
-		DEFAULT_SOURCE_MODEL_RE.test(`${modelOrSpec.provider}/${modelOrSpec.id}`) ||
-		(Boolean(modelOrSpec.name) && DEFAULT_SOURCE_MODEL_RE.test(modelOrSpec.name!))
-	);
-}
-
-export function syncDefaultSourceModels(
-	config: TranslatorConfig,
-	availableModels: readonly AvailableModelInfo[],
-): boolean {
-	const existing = new Set(config.sourceModels.map((m) => m.trim().toLowerCase()));
-	const excluded = new Set((config.excludedModels ?? []).map((m) => m.trim().toLowerCase()));
-	let changed = false;
-
-	for (const model of availableModels) {
-		if (!isDefaultSourceModel(model)) continue;
-		const fullId = `${model.provider}/${model.id}`;
-		const key = fullId.toLowerCase();
-		if (existing.has(key) || excluded.has(key)) continue;
-		config.sourceModels.push(fullId);
-		existing.add(key);
-		changed = true;
-	}
-
-	return changed;
-}
-
-export function setSourceModelSelected(config: TranslatorConfig, modelId: string, selected: boolean): void {
+export function setModelExcluded(config: TranslatorConfig, modelId: string, excluded: boolean): void {
 	const trimmed = modelId.trim();
 	if (!trimmed) return;
 	const key = trimmed.toLowerCase();
-	const sourceFiltered = config.sourceModels.filter((m) => m.trim().toLowerCase() !== key);
-	const excludedFiltered = (config.excludedModels ?? []).filter((m) => m.trim().toLowerCase() !== key);
-
-	if (selected) {
-		config.sourceModels = [...sourceFiltered, trimmed];
-		config.excludedModels = excludedFiltered;
-	} else {
-		config.sourceModels = sourceFiltered;
-		config.excludedModels = [...excludedFiltered, trimmed];
-	}
+	const filtered = config.excludedModels.filter((m) => m.trim().toLowerCase() !== key);
+	config.excludedModels = excluded ? [...filtered, trimmed] : filtered;
 }
 
 export function parseProviderAndModel(spec: string): { provider?: string; modelId: string } {
@@ -85,13 +36,12 @@ export function parseProviderAndModel(spec: string): { provider?: string; modelI
 	};
 }
 
-export function matchesSourceModel(
-	sourceModels: readonly string[],
+export function shouldTranslateModel(
+	excludedModels: readonly string[],
 	msgProvider?: string,
 	msgModel?: string,
 	activeModel?: { provider: string; id: string },
 ): boolean {
-	if (sourceModels.length === 0) return false;
 	const candidates = new Set<string>();
 	if (msgProvider && msgModel) candidates.add(`${msgProvider}/${msgModel}`.toLowerCase());
 	if (msgModel) candidates.add(msgModel.toLowerCase());
@@ -99,13 +49,10 @@ export function matchesSourceModel(
 		candidates.add(`${activeModel.provider}/${activeModel.id}`.toLowerCase());
 		candidates.add(activeModel.id.toLowerCase());
 	}
-	for (const pattern of sourceModels) {
+	return !excludedModels.some((pattern) => {
 		const normalized = pattern.trim().toLowerCase();
-		if (normalized && candidates.has(normalized)) {
-			return true;
-		}
-	}
-	return false;
+		return normalized && candidates.has(normalized);
+	});
 }
 
 export function extractThinkingRuns(content: unknown): { blocks: string[]; runs: string[][] } {
